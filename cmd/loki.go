@@ -22,7 +22,6 @@ package cmd
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -133,8 +132,6 @@ func (h *lokiHook) start() error {
 
 // fill one of two equally sized slices with entries and then push it while filling the other one
 // TODO clean old entries after push?
-// TODO this will be much faster if we can reuse rfc5424.Messages and they can use less intermediary
-// buffers
 func (h *lokiHook) loop() {
 	var (
 		msgs       = make([]tmpMsg, h.limit)
@@ -150,7 +147,6 @@ func (h *lokiHook) loop() {
 	go func() {
 		oldLogs := make([]tmpMsg, 0, h.limit*2)
 		for ch := range pushCh {
-			// TODO rewrite this when we know by what we are going to limit
 			msgsToPush, msgs = msgs, msgsToPush
 			oldCount, oldDropped := count, dropped
 			count, dropped = 0, 0
@@ -187,6 +183,7 @@ func (h *lokiHook) loop() {
 				labels[params[0]] = params[1]
 			}
 			labels["level"] = entry.Level.String()
+			// TODO have the cutoff here ?
 			msgs[count] = tmpMsg{
 				labels: labels,
 				msg:    entry.Message,
@@ -214,20 +211,19 @@ func (h *lokiHook) push(msgs []tmpMsg, dropped int) (int, error) {
 
 	// We can technically cutoff during the addMsg phase, which will be even better if we sort after
 	// it as well ... maybe
-	cutoff := time.Now().Add(-time.Millisecond * 500) // probably better to be configurable
-	cutOffNano := cutoff.UnixNano()
+	cutOff := time.Now().Add(-time.Millisecond * 500).UnixNano() // probably better to be configurable
 
-	cutoffPoint := sort.Search(len(msgs), func(i int) bool {
-		return !(msgs[i].t < cutOffNano)
+	cutOffPoint := sort.Search(len(msgs), func(i int) bool {
+		return !(msgs[i].t < cutOff)
 	})
 
-	if cutoffPoint > len(msgs) {
-		cutoffPoint = len(msgs)
+	if cutOffPoint > len(msgs) {
+		cutOffPoint = len(msgs)
 	}
 
 	strms := new(lokiPushMessage)
 
-	for _, msg := range msgs[:cutoffPoint] {
+	for _, msg := range msgs[:cutOffPoint] {
 		strms.add(msg)
 	}
 	if dropped != 0 {
@@ -242,22 +238,23 @@ func (h *lokiHook) push(msgs []tmpMsg, dropped int) (int, error) {
 			labels: labels,
 			msg: fmt.Sprintf("k6 dropped some packages because they were above the limit of %d/%s",
 				h.limit, h.pushPeriod),
-			t: cutOffNano,
+			t: msgs[cutOffPoint-1].t,
 		}
 		strms.add(msg)
 	}
 
-	b, err := json.Marshal(strms)
+	var b bytes.Buffer
+	_, err := strms.WriteTo(&b)
 	if err != nil {
-		return cutoffPoint, err
+		return cutOffPoint, err
 	}
 	// TODO use a custom client
-	res, err := http.Post(h.addr, "application/json", bytes.NewBuffer(b)) //nolint:noctx
+	res, err := http.Post(h.addr, "application/json", &b) //nolint:noctx
 	if res != nil {
 		_, _ = io.Copy(ioutil.Discard, res.Body)
 		_ = res.Body.Close()
 	}
-	return cutoffPoint, err
+	return cutOffPoint, err
 }
 
 func mapEqual(a, b map[string]string) bool {
@@ -322,6 +319,55 @@ func (h *lokiHook) Levels() []logrus.Level {
 */
 type lokiPushMessage struct {
 	Streams []*stream `json:"streams"`
+}
+
+func (strms *lokiPushMessage) WriteTo(w io.Writer) (n int64, err error) {
+	var k int
+	write := func(b []byte) {
+		if err != nil {
+			return
+		}
+		k, err = w.Write(b)
+		n += int64(k)
+	}
+	// 10+ 9 for the amount of nanoseconds between 2001 and 2286 also it overflows in the year 2262 ;)
+	var nanoseconds [19]byte
+	write([]byte(`{"streams":[`))
+	for i, str := range strms.Streams {
+		if i != 0 {
+			write([]byte(`,`))
+		}
+		write([]byte(`{"stream":{`))
+		var f bool
+		for k, v := range str.Stream {
+			if f {
+				write([]byte(`,`))
+			}
+			f = true
+			write([]byte(`"`))
+			write([]byte(k))
+			write([]byte(`":"`))
+			write([]byte(v))
+			write([]byte(`"`))
+		}
+		write([]byte(`},"values":[`))
+		for j, v := range str.Values {
+			if j != 0 {
+				write([]byte(`,`))
+			}
+			write([]byte(`["`))
+			strconv.AppendInt(nanoseconds[:0], v.t, 10)
+			write(nanoseconds[:])
+			write([]byte(`","`))
+			write([]byte(v.msg))
+			write([]byte(`"]`))
+		}
+		write([]byte(`]}`))
+	}
+
+	write([]byte(`]}`))
+
+	return n, err
 }
 
 type stream struct {
