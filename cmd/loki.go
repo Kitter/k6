@@ -27,7 +27,6 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
-	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -138,35 +137,34 @@ func (h *lokiHook) start() error {
 // buffers
 func (h *lokiHook) loop() {
 	var (
-		entrys             = make([]*logrus.Entry, h.limit)
-		entriesBeingPushed = make([]*logrus.Entry, h.limit)
-		dropped            int
-		count              int
-		ticker             = time.NewTicker(h.pushPeriod)
-		pushCh             = make(chan chan struct{})
+		msgs       = make([]tmpMsg, h.limit)
+		msgsToPush = make([]tmpMsg, h.limit)
+		dropped    int
+		count      int
+		ticker     = time.NewTicker(h.pushPeriod)
+		pushCh     = make(chan chan struct{})
 	)
 
 	defer close(pushCh)
 
 	go func() {
-		oldLogs := make([]*logrus.Entry, 0, h.limit)
+		oldLogs := make([]tmpMsg, 0, h.limit*2)
 		for ch := range pushCh {
 			// TODO rewrite this when we know by what we are going to limit
-			entriesBeingPushed, entrys = entrys, entriesBeingPushed
+			msgsToPush, msgs = msgs, msgsToPush
 			oldCount, oldDropped := count, dropped
 			count, dropped = 0, 0
 			close(ch) // signal that more buffering can continue
-			// TODO optimize a lot
-			newslice := append(append([]*logrus.Entry{}, oldLogs...), entriesBeingPushed[:oldCount]...)
-			n, err := h.push(newslice, oldDropped)
+
+			copy(oldLogs[len(oldLogs):len(oldLogs)+oldCount], msgsToPush[:oldCount])
+			oldLogs = oldLogs[:len(oldLogs)+oldCount]
+			n, err := h.push(oldLogs, oldDropped)
 			_ = err // TODO print it on terminal ?!?
-			if n > len(newslice) {
+			if n > len(oldLogs) {
 				oldLogs = oldLogs[:0]
 				continue
 			}
-			leftOver := newslice[n:]
-			oldLogs = oldLogs[:len(leftOver)]
-			copy(oldLogs, leftOver)
+			oldLogs = oldLogs[:copy(oldLogs, oldLogs[n:])]
 		}
 	}()
 
@@ -180,7 +178,20 @@ func (h *lokiHook) loop() {
 				dropped++
 				continue
 			}
-			entrys[count] = entry
+			labels := make(map[string]string, len(entry.Data)+1)
+			for k, v := range entry.Data {
+				// TODO filter the additional ones
+				labels[k] = fmt.Sprint(v) // TODO optimize ?
+			}
+			for _, params := range h.additionalParams {
+				labels[params[0]] = params[1]
+			}
+			labels["level"] = entry.Level.String()
+			msgs[count] = tmpMsg{
+				labels: labels,
+				msg:    entry.Message,
+				t:      entry.Time.UnixNano(),
+			}
 			count++
 		case <-ticker.C:
 			ch := make(chan struct{})
@@ -190,45 +201,50 @@ func (h *lokiHook) loop() {
 	}
 }
 
-func (h *lokiHook) push(entrys []*logrus.Entry, dropped int) (int, error) {
-	if len(entrys) == 0 {
+func (h *lokiHook) push(msgs []tmpMsg, dropped int) (int, error) {
+	if len(msgs) == 0 {
 		return 0, nil
 	}
 
-	// Here UnixNano is used instead of Before as ... before doesn't order by the value of UnixNano
-	// ... somehow. To be investigated further
-	sort.Slice(entrys, func(i, j int) bool {
-		return entrys[i].Time.UnixNano() < entrys[j].Time.UnixNano()
+	// TODO using time.Before was giving a lot of out of order, but even now, there are some, if the
+	// limit is big enough ...
+	sort.Slice(msgs, func(i, j int) bool {
+		return msgs[i].t < msgs[j].t
 	})
 
+	// We can technically cutoff during the addMsg phase, which will be even better if we sort after
+	// it as well ... maybe
 	cutoff := time.Now().Add(-time.Millisecond * 500) // probably better to be configurable
+	cutOffNano := cutoff.UnixNano()
 
-	cutoffPoint := sort.Search(len(entrys), func(i int) bool {
-		return !(entrys[i].Time.UnixNano() < cutoff.UnixNano())
+	cutoffPoint := sort.Search(len(msgs), func(i int) bool {
+		return !(msgs[i].t < cutOffNano)
 	})
 
-	if cutoffPoint > len(entrys) {
-		cutoffPoint = len(entrys)
+	if cutoffPoint > len(msgs) {
+		cutoffPoint = len(msgs)
 	}
 
 	strms := new(lokiPushMessage)
 
-	for _, entry := range entrys[:cutoffPoint] {
-		addMsg(strms, entry, h.additionalParams)
+	for _, msg := range msgs[:cutoffPoint] {
+		strms.add(msg)
 	}
 	if dropped != 0 {
-		addMsg(strms,
-			&logrus.Entry{
-				Data: logrus.Fields{
-					"droppedCount": dropped,
-				},
-				Level: logrus.WarnLevel,
-				Message: fmt.Sprintf("k6 dropped some packages because they were above the limit of %d/%s",
-					h.limit, h.pushPeriod),
-				Time: cutoff,
-			},
-			h.additionalParams,
-		)
+		labels := make(map[string]string, 2+len(h.additionalParams))
+		labels["level"] = logrus.WarnLevel.String()
+		labels["dropped"] = strconv.Itoa(dropped)
+		for _, params := range h.additionalParams {
+			labels[params[0]] = params[1]
+		}
+
+		msg := tmpMsg{
+			labels: labels,
+			msg: fmt.Sprintf("k6 dropped some packages because they were above the limit of %d/%s",
+				h.limit, h.pushPeriod),
+			t: cutOffNano,
+		}
+		strms.add(msg)
 	}
 
 	b, err := json.Marshal(strms)
@@ -244,36 +260,40 @@ func (h *lokiHook) push(entrys []*logrus.Entry, dropped int) (int, error) {
 	return cutoffPoint, err
 }
 
-func addMsg(strms *lokiPushMessage, entry *logrus.Entry, additionalParams [][2]string) {
-	labels := msgToLabels(entry, additionalParams)
+func mapEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if v2, ok := b[k]; !ok || v2 != v {
+			return false
+		}
+	}
+	return true
+}
+
+func (strms *lokiPushMessage) add(entry tmpMsg) {
 	var foundStrm *stream
 	for _, strm := range strms.Streams {
-		if reflect.DeepEqual(strm.Stream, labels) {
+		if mapEqual(strm.Stream, entry.labels) {
 			foundStrm = strm
 			break
 		}
 	}
+
 	if foundStrm == nil {
-		foundStrm = &stream{Stream: labels}
+		foundStrm = &stream{Stream: entry.labels}
 		strms.Streams = append(strms.Streams, foundStrm)
 	}
-	foundStrm.Values = append(foundStrm.Values,
-		[2]string{strconv.FormatInt(entry.Time.UnixNano(), 10), entry.Message})
+
+	foundStrm.Values = append(foundStrm.Values, logEntry{t: entry.t, msg: entry.msg})
 }
 
-func msgToLabels(entry *logrus.Entry, additionalParams [][2]string) map[string]string {
-	labels := make(map[string]string, 1+len(entry.Data)+len(additionalParams))
-	// TODO figure out if entrys share their entry.Data and use that to not recreate the same
-	// sdParams
-	labels["level"] = entry.Level.String()
-	for name, value := range entry.Data {
-		labels[name] = fmt.Sprint(value)
-	}
-
-	for _, param := range additionalParams {
-		labels[param[0]] = param[1]
-	}
-	return labels
+// this is temporary message format
+type tmpMsg struct {
+	labels map[string]string
+	t      int64
+	msg    string
 }
 
 func (h *lokiHook) Fire(entry *logrus.Entry) error {
@@ -306,5 +326,24 @@ type lokiPushMessage struct {
 
 type stream struct {
 	Stream map[string]string `json:"stream"`
-	Values [][2]string       `json:"values"`
+	Values []logEntry        `json:"values"`
+}
+
+type logEntry struct {
+	t   int64  // nanoseconds
+	msg string // maybe intern those as they are likely to be the same for an interval
+}
+
+// rewrite this either with easyjson or with a custom marshalling
+func (l logEntry) MarshalJSON() ([]byte, error) {
+	// 2 for '[]', 1 for ',', 4 for '"' and 10 + 9 for the amount of nanoseconds between 2001 and
+	// 2286 also it overflows in the year 2262 ;)
+	b := make([]byte, 2, len(l.msg)+26)
+	b[0] = '['
+	b[1] = '"'
+	b = strconv.AppendInt(b, l.t, 10)
+	b = append(b, '"', ',', '"')
+	b = append(b, l.msg...)
+	b = append(b, '"', ']')
+	return b, nil
 }

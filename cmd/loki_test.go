@@ -21,6 +21,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -91,4 +92,16 @@ func TestSyslogFromConfigLine(t *testing.T) {
 			require.Equal(t, &test.res, res)
 		})
 	}
+}
+
+func TestLogEntryMarshal(t *testing.T) {
+	entry := logEntry{
+		t:   9223372036854775807, // the actual max
+		msg: "something",
+	}
+	expected := []byte(`["9223372036854775807","something"]`)
+	s, err := json.Marshal(entry)
+	require.NoError(t, err)
+
+	require.Equal(t, expected, s)
 }
